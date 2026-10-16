@@ -1,9 +1,13 @@
--- ============================================================
--- VYLOGIX SUPER ADMIN — LEAN DATABASE SCHEMA (CONTROL PLANE)
--- Eksekusi file ini di SQL Editor pada project: db-superadmin
--- ============================================================
+-- ==============================================================================
+-- VYLOGIX SUPER ADMIN — CONTROL PLANE SCHEMA (DATABASE 1: db-superadmin)
+-- Project: https://texqvnhohrongnlmfrvs.supabase.co
+-- Tujuan: Khusus untuk Manajemen Platform SaaS Multi-Tenant (Master Registry & Lisensi)
+-- Total Tabel Akhir: HANYA 3 TABEL (Ultra Ringan & Bersih)
+-- ==============================================================================
 
--- 1. Bersihkan tabel-tabel operasional tenant yang tidak dipakai di Control Plane
+-- ------------------------------------------------------------------------------
+-- 1. HAPUS SEMUA TABEL OPERASIONAL TENANT / CRM YANG TIDAK DIPERLUKAN
+-- ------------------------------------------------------------------------------
 DROP TABLE IF EXISTS maintenance_tickets CASCADE;
 DROP TABLE IF EXISTS inventory_transactions CASCADE;
 DROP TABLE IF EXISTS inventory_items CASCADE;
@@ -19,40 +23,51 @@ DROP TABLE IF EXISTS project_physical_details CASCADE;
 DROP TABLE IF EXISTS project_digital_details CASCADE;
 DROP TABLE IF EXISTS projects CASCADE;
 DROP TABLE IF EXISTS agency_services CASCADE;
+DROP TABLE IF EXISTS role_permissions CASCADE;
+DROP TABLE IF EXISTS permissions CASCADE;
+DROP TABLE IF EXISTS roles CASCADE;
 
--- 2. Pastikan Tabel Inti Master Platform ada
+-- ------------------------------------------------------------------------------
+-- 2. TABEL 1: ORGANIZATIONS (Master Registry Agensi & Status Lisensi)
+-- ------------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS organizations (
-    id                  UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
-    name                TEXT        NOT NULL,
-    slug                TEXT        UNIQUE,
-    is_active           BOOLEAN     DEFAULT true,
-    auto_suspend        BOOLEAN     DEFAULT false,
-    license_expires_at  TIMESTAMPTZ DEFAULT NULL,
-    tagline             TEXT        DEFAULT NULL,
-    logo_url            TEXT        DEFAULT NULL,
-    webhook_url         TEXT        DEFAULT NULL,
-    log_retention_days  INTEGER     DEFAULT 30,
-    whatsapp_number     TEXT        DEFAULT NULL,
-    industry_type       TEXT        DEFAULT 'DIGITAL',
-    qris_image_url      TEXT        DEFAULT NULL,
-    module_digital      BOOLEAN     DEFAULT true,
-    module_physical     BOOLEAN     DEFAULT false,
-    custom_asset_categories TEXT[]  DEFAULT ARRAY['Logo & Branding', 'Font & Tipografi', 'Desain Siap Cetak', 'Dokumen & Copywriting', 'Gambar Konten Web/App', 'Lainnya']::TEXT[],
-    created_at          TIMESTAMPTZ DEFAULT now() NOT NULL
+    id                      UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
+    name                    TEXT        NOT NULL,
+    slug                    TEXT        UNIQUE,
+    is_active               BOOLEAN     DEFAULT true,
+    auto_suspend            BOOLEAN     DEFAULT false,
+    license_expires_at      TIMESTAMPTZ DEFAULT NULL,
+    tagline                 TEXT        DEFAULT NULL,
+    logo_url                TEXT        DEFAULT NULL,
+    webhook_url             TEXT        DEFAULT NULL,
+    log_retention_days      INTEGER     DEFAULT 30,
+    whatsapp_number         TEXT        DEFAULT NULL,
+    industry_type           TEXT        DEFAULT 'DIGITAL',
+    qris_image_url          TEXT        DEFAULT NULL,
+    module_digital          BOOLEAN     DEFAULT true,
+    module_physical         BOOLEAN     DEFAULT false,
+    custom_asset_categories TEXT[]      DEFAULT ARRAY['Logo & Branding', 'Font & Tipografi', 'Desain Siap Cetak', 'Dokumen & Copywriting', 'Gambar Konten Web/App', 'Lainnya']::TEXT[],
+    created_at              TIMESTAMPTZ DEFAULT now() NOT NULL
 );
 
+-- ------------------------------------------------------------------------------
+-- 3. TABEL 2: PROFILES (Akun Pengelola Master Super Administrator)
+-- ------------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS profiles (
-    id              UUID    PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-    email           TEXT    NOT NULL,
+    id              UUID        PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    email           TEXT        NOT NULL,
     full_name       TEXT,
-    role            TEXT    DEFAULT 'super_admin',
-    organization_id UUID    REFERENCES organizations(id) ON DELETE SET NULL,
-    whatsapp_number TEXT    DEFAULT NULL,
-    address         TEXT    DEFAULT NULL,
-    supplier_goods  TEXT    DEFAULT NULL,
+    role            TEXT        DEFAULT 'super_admin',
+    organization_id UUID        REFERENCES organizations(id) ON DELETE SET NULL,
+    whatsapp_number TEXT        DEFAULT NULL,
+    address         TEXT        DEFAULT NULL,
+    supplier_goods  TEXT        DEFAULT NULL,
     created_at      TIMESTAMPTZ DEFAULT now() NOT NULL
 );
 
+-- ------------------------------------------------------------------------------
+-- 4. TABEL 3: AUDIT_LOGS (Catatan Jejak Audit Keamanan Platform)
+-- ------------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS audit_logs (
     id              UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
     organization_id UUID        REFERENCES organizations(id) ON DELETE CASCADE,
@@ -66,7 +81,9 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at      TIMESTAMPTZ DEFAULT now() NOT NULL
 );
 
--- Trigger untuk User Baru Auth Supabase -> Profiles Super Admin
+-- ------------------------------------------------------------------------------
+-- 5. TRIGGER OTOMATIS: User Baru di Auth -> Otomatis Menjadi Super Admin
+-- ------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.handle_new_superadmin_user()
 RETURNS trigger AS $$
 BEGIN
@@ -78,7 +95,7 @@ BEGIN
         'super_admin'
     )
     ON CONFLICT (id) DO UPDATE
-    SET email = EXCLUDED.email;
+    SET email = EXCLUDED.email, role = 'super_admin';
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -88,12 +105,13 @@ CREATE TRIGGER on_auth_user_created
     AFTER INSERT ON auth.users
     FOR EACH ROW EXECUTE PROCEDURE public.handle_new_superadmin_user();
 
--- Enable RLS
+-- ------------------------------------------------------------------------------
+-- 6. ROW LEVEL SECURITY (RLS) & POLICIES
+-- ------------------------------------------------------------------------------
 ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 
--- Policy Sederhana Super Admin
 DROP POLICY IF EXISTS "Superadmin Akses Penuh Orgs" ON organizations;
 CREATE POLICY "Superadmin Akses Penuh Orgs" ON organizations FOR ALL USING (true);
 
@@ -102,3 +120,7 @@ CREATE POLICY "Superadmin Akses Penuh Profiles" ON profiles FOR ALL USING (true)
 
 DROP POLICY IF EXISTS "Superadmin Akses Penuh Audit" ON audit_logs;
 CREATE POLICY "Superadmin Akses Penuh Audit" ON audit_logs FOR ALL USING (true);
+
+-- ==============================================================================
+-- SELESAI. Database Control Plane (db-superadmin) kini rapi dan hanya memiliki 3 tabel!
+-- ==============================================================================
