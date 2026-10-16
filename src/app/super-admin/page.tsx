@@ -2,7 +2,7 @@ import { createClient } from '@/utils/supabase/server'
 import { redirect } from 'next/navigation'
 import { Crown, LogOut, Building2, Users, Layers, Ban, CheckCircle, Zap, Globe, Package, DollarSign } from 'lucide-react'
 import { logout } from '@/app/login/actions'
-import { createAdminClient } from '@/utils/supabase/admin'
+import { createAdminClient, createCrmAdminClient } from '@/utils/supabase/admin'
 import { getBroadcasts, getSystemSettings } from '@/lib/superAdminStore'
 import SuperAdminTabs from './SuperAdminTabs'
 
@@ -44,8 +44,10 @@ export default async function SuperAdminDashboard() {
 
   if (!user) redirect('/')
 
-  // Verify super_admin role
+  // Verify super_admin role on Master DB
   const supabaseAdmin = createAdminClient()
+  const crmAdmin = createCrmAdminClient()
+
   const { data: profile } = await supabaseAdmin
     .from('profiles')
     .select('role')
@@ -56,7 +58,7 @@ export default async function SuperAdminDashboard() {
     redirect('/dashboard')
   }
 
-  // ── Fetch base org list ────────────────────────────────────────────────────
+  // ── Fetch base org list from Master DB ────────────────────────────────────
   const { data: orgs } = await supabaseAdmin
     .from('organizations')
     .select('*')
@@ -72,13 +74,13 @@ export default async function SuperAdminDashboard() {
   if (orgs && orgs.length > 0) {
     const orgIds = orgs.map((a) => a.id).filter(Boolean)
 
-    // Parallel fetch: profiles, projects, services, transactions, sheet_configs
+    // Parallel fetch from CRM Data Plane: profiles, projects, services, transactions, sheet_configs
     const [profilesResult, projectCountsResult, servicesResult, txResult, sheetsResult] = await Promise.all([
-      supabaseAdmin.from('profiles').select('id, email, role, organization_id'),
-      supabaseAdmin.from('projects').select('id, organization_id'),
-      supabaseAdmin.from('agency_services').select('id, name, organization_id').in('organization_id', orgIds).order('name', { ascending: true }),
-      supabaseAdmin.from('fin_transactions').select('id, organization_id, amount, type'),
-      supabaseAdmin.from('agency_sheet_configs').select('agency_id, sheet_id')
+      crmAdmin.from('profiles').select('id, email, role, organization_id'),
+      crmAdmin.from('projects').select('id, organization_id'),
+      crmAdmin.from('agency_services').select('id, name, organization_id').in('organization_id', orgIds).order('name', { ascending: true }),
+      crmAdmin.from('fin_transactions').select('id, organization_id, amount, type'),
+      crmAdmin.from('agency_sheet_configs').select('agency_id, sheet_id')
     ])
 
     const allProfiles = profilesResult.data ?? []

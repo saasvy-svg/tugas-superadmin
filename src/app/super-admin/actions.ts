@@ -1,6 +1,6 @@
 'use server'
 
-import { createAdminClient } from '@/utils/supabase/admin'
+import { createAdminClient, createCrmAdminClient } from '@/utils/supabase/admin'
 import { createClient } from '@/utils/supabase/server'
 import { revalidatePath } from 'next/cache'
 import { cookies } from 'next/headers'
@@ -97,23 +97,13 @@ export async function registerAgency(formData: FormData) {
   const generatedPassword = generateStrongPassword()
 
   try {
-    // 1. Buat user baru di Supabase Auth
-    const { data: authData, error: createError } = await supabase.auth.admin.createUser({
-      email: ownerEmail,
-      password: generatedPassword,
-      email_confirm: true,
-    })
+    const crmDb = createCrmAdminClient()
 
-    if (createError) return { error: createError.message }
-    if (!authData.user) return { error: 'Gagal membuat akun baru.' }
-
-    const newUserId = authData.user.id
-
-    // Tentukan flag modul berdasarkan industryType
+    // 1. Tentukan flag modul
     const moduleDigital = safeIndustryType === 'DIGITAL' || safeIndustryType === 'HYBRID'
     const modulePhysical = safeIndustryType === 'PHYSICAL' || safeIndustryType === 'HYBRID'
 
-    // 2. Buat organisasi dengan industry_type & flag modul
+    // 2. Simpan Master Organisasi di DB Super Admin
     const { data: orgData, error: orgError } = await supabase
       .from('organizations')
       .insert({ 
@@ -127,15 +117,45 @@ export async function registerAgency(formData: FormData) {
       .select('id')
       .single()
 
-
     if (orgError) {
-      // Rollback: hapus auth user jika org gagal dibuat
-      await supabase.auth.admin.deleteUser(newUserId)
-      return { error: 'Gagal membuat organisasi: ' + orgError.message }
+      return { error: 'Gagal membuat organisasi di master: ' + orgError.message }
     }
 
-    // 3. Update profile user: jadikan admin, hubungkan ke org
-    const { error: profileError } = await supabase
+    // 3. Buat User Admin di Auth DB CRM
+    const { data: authData, error: createError } = await crmDb.auth.admin.createUser({
+      email: ownerEmail,
+      password: generatedPassword,
+      email_confirm: true,
+    })
+
+    if (createError) {
+      await supabase.from('organizations').delete().eq('id', orgData.id)
+      return { error: 'Gagal membuat akun admin di DB CRM: ' + createError.message }
+    }
+
+    const newUserId = authData.user!.id
+
+    // 4. Catat Organisasi Tenant di DB CRM dengan ID yang sama
+    const { error: crmOrgError } = await crmDb
+      .from('organizations')
+      .insert({
+        id: orgData.id,
+        name: agencyName,
+        slug,
+        is_active: true,
+        industry_type: safeIndustryType,
+        module_digital: moduleDigital,
+        module_physical: modulePhysical
+      })
+
+    if (crmOrgError) {
+      await crmDb.auth.admin.deleteUser(newUserId)
+      await supabase.from('organizations').delete().eq('id', orgData.id)
+      return { error: 'Gagal inisialisasi organisasi di DB CRM: ' + crmOrgError.message }
+    }
+
+    // 5. Update Profile User di DB CRM: role = 'admin'
+    const { error: profileError } = await crmDb
       .from('profiles')
       .update({
         role: 'admin',
@@ -144,13 +164,13 @@ export async function registerAgency(formData: FormData) {
       .eq('id', newUserId)
 
     if (profileError) {
-      // Rollback
-      await supabase.auth.admin.deleteUser(newUserId)
+      await crmDb.auth.admin.deleteUser(newUserId)
+      await crmDb.from('organizations').delete().eq('id', orgData.id)
       await supabase.from('organizations').delete().eq('id', orgData.id)
-      return { error: 'Gagal mengatur profil admin: ' + profileError.message }
+      return { error: 'Gagal mengatur profil admin di DB CRM: ' + profileError.message }
     }
 
-    // 4. Provision layanan default berdasarkan industry_type
+    // 6. Provision layanan default di DB CRM
     let defaultServices: { organization_id: string; name: string; service_category: string }[] = []
     
     if (safeIndustryType === 'DIGITAL') {
@@ -175,10 +195,9 @@ export async function registerAgency(formData: FormData) {
       ]
     }
 
-    const { error: srvError } = await supabase.from('agency_services').insert(defaultServices)
+    const { error: srvError } = await crmDb.from('agency_services').insert(defaultServices)
     if (srvError) {
-      console.error('Gagal membuat layanan default:', srvError)
-      // Non-fatal: lanjutkan saja, admin bisa tambah manual
+      console.error('Gagal membuat layanan default di DB CRM:', srvError)
     }
 
     revalidatePath('/super-admin')
@@ -223,13 +242,25 @@ export async function suspendAgency(orgId: string, shouldSuspend: boolean) {
   if (!orgId) return { error: 'ID organisasi tidak valid.' }
 
   const supabase = createAdminClient()
+  const crmDb = createCrmAdminClient()
 
+  // 1. Update di Master DB Super Admin
   const { error } = await supabase
     .from('organizations')
     .update({ is_active: !shouldSuspend })
     .eq('id', orgId)
 
   if (error) return { error: error.message }
+
+  // 2. Sinkronisasi status saklar ke Data Plane (DB CRM)
+  const { error: crmError } = await crmDb
+    .from('organizations')
+    .update({ is_active: !shouldSuspend })
+    .eq('id', orgId)
+
+  if (crmError) {
+    console.error('Peringatan: Gagal sinkronisasi status suspend ke DB CRM:', crmError.message)
+  }
 
   // 📝 Catat audit: status suspend agensi berubah
   const { data: { user: superAdmin } } = await (await createClient()).auth.getUser()
@@ -264,6 +295,7 @@ export async function updateLicenseExpiry(
   if (!orgId) return { error: 'ID organisasi tidak valid.' }
 
   const supabase = createAdminClient()
+  const crmDb = createCrmAdminClient()
 
   // Jika auto_suspend aktif dan tanggal sudah lewat → langsung suspend
   let isActive: boolean | null = null
@@ -282,12 +314,19 @@ export async function updateLicenseExpiry(
     updatePayload.is_active = isActive
   }
 
+  // 1. Update Master DB Super Admin
   const { error } = await supabase
     .from('organizations')
     .update(updatePayload)
     .eq('id', orgId)
 
   if (error) return { error: error.message }
+
+  // 2. Update DB CRM
+  await crmDb
+    .from('organizations')
+    .update(updatePayload)
+    .eq('id', orgId)
 
   revalidatePath('/super-admin')
   return { success: true, autoSuspended: isActive === false }
@@ -314,8 +353,9 @@ export async function addAdminToAgency(
   if (!fullName?.trim())       return { error: 'Nama tidak boleh kosong.' }
 
   const supabase = createAdminClient()
+  const crmDb = createCrmAdminClient()
 
-  // Pastikan org ada
+  // Pastikan org ada di DB Super Admin
   const { data: org } = await supabase
     .from('organizations')
     .select('id, name')
@@ -327,8 +367,8 @@ export async function addAdminToAgency(
   // Generate password kriptografis
   const generatedPassword = generateStrongPassword(14)
 
-  // Buat user baru di Auth
-  const { data: authData, error: createError } = await supabase.auth.admin.createUser({
+  // Buat user baru di Auth DB CRM
+  const { data: authData, error: createError } = await crmDb.auth.admin.createUser({
     email: email.trim(),
     password: generatedPassword,
     email_confirm: true,
@@ -337,15 +377,15 @@ export async function addAdminToAgency(
   if (createError) {
     // User dengan email ini sudah ada
     if (createError.message.includes('already registered') || createError.status === 422) {
-      return { error: `Email ${email} sudah terdaftar di sistem.` }
+      return { error: `Email ${email} sudah terdaftar di sistem CRM.` }
     }
     return { error: createError.message }
   }
 
-  if (!authData.user) return { error: 'Gagal membuat akun.' }
+  if (!authData.user) return { error: 'Gagal membuat akun di DB CRM.' }
 
-  // Set role admin dan hubungkan ke org yang dipilih
-  const { error: profileError } = await supabase
+  // Set role admin dan hubungkan ke org yang dipilih di DB CRM
+  const { error: profileError } = await crmDb
     .from('profiles')
     .update({
       full_name:       fullName.trim(),
@@ -356,18 +396,18 @@ export async function addAdminToAgency(
 
   if (profileError) {
     // Rollback: hapus auth user jika profile gagal
-    await supabase.auth.admin.deleteUser(authData.user.id)
-    return { error: 'Gagal menyimpan profil admin baru.' }
+    await crmDb.auth.admin.deleteUser(authData.user.id)
+    return { error: 'Gagal menyimpan profil admin baru di DB CRM: ' + profileError.message }
   }
 
-  // 📝 Audit log
+  // 📝 Audit log di Master DB Super Admin
   const { data: { user: superAdmin } } = await (await createClient()).auth.getUser()
   if (superAdmin) {
     await logAudit({
       organizationId: null,
       actorId:        superAdmin.id,
       actorEmail:     superAdmin.email,
-      action:         AUDIT_ACTIONS.CLIENT_CREATE, // Re-use for now; can add ADMIN_CREATE constant later
+      action:         AUDIT_ACTIONS.CLIENT_CREATE,
       targetType:     'admin',
       targetId:       authData.user.id,
       targetName:     fullName.trim(),
@@ -390,7 +430,6 @@ export async function addAdminToAgency(
 // removeAdminFromAgency — Hapus admin dari agensi
 //
 // Hanya bisa dilakukan oleh super_admin.
-// Admin yang dihapus profilenya di-unlink dari org (organization_id = null).
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function removeAdminFromAgency(adminUserId: string, orgId: string) {
@@ -399,10 +438,10 @@ export async function removeAdminFromAgency(adminUserId: string, orgId: string) 
 
   if (!adminUserId || !orgId) return { error: 'Parameter tidak valid.' }
 
-  const supabase = createAdminClient()
+  const crmDb = createCrmAdminClient()
 
-  // Verifikasi: user ini memang admin di org ini
-  const { data: profile } = await supabase
+  // Verifikasi: user ini memang admin di org ini pada DB CRM
+  const { data: profile } = await crmDb
     .from('profiles')
     .select('id, full_name, role, organization_id')
     .eq('id', adminUserId)
@@ -412,8 +451,8 @@ export async function removeAdminFromAgency(adminUserId: string, orgId: string) 
 
   if (!profile) return { error: 'Admin tidak ditemukan di organisasi ini.' }
 
-  // Hapus dari Supabase Auth sekalian (hard delete)
-  const { error: deleteError } = await supabase.auth.admin.deleteUser(adminUserId)
+  // Hapus dari Supabase Auth DB CRM (hard delete)
+  const { error: deleteError } = await crmDb.auth.admin.deleteUser(adminUserId)
   if (deleteError) return { error: deleteError.message }
 
   revalidatePath('/super-admin')
@@ -430,9 +469,9 @@ export async function getProjectsByAgency(orgId: string) {
 
   if (!orgId) return { error: 'ID organisasi tidak valid.' }
 
-  const supabase = createAdminClient()
+  const crmDb = createCrmAdminClient()
 
-  const { data, error } = await supabase
+  const { data, error } = await crmDb
     .from('projects')
     .select(`
       id,
@@ -461,17 +500,15 @@ export async function toggleProjectRetention(projectId: string, currentStatus: b
 
   if (!projectId) return { error: 'ID proyek tidak valid.' }
 
-  const supabase = createAdminClient()
+  const crmDb = createCrmAdminClient()
 
-  const { error } = await supabase
+  const { error } = await crmDb
     .from('projects')
     .update({ skip_asset_cleanup: !currentStatus })
     .eq('id', projectId)
 
   if (error) return { error: error.message }
 
-  // revalidatePath tidak perlu strict di sini karena fetching dari sisi client,
-  // tapi kita bisa tetap sediakan.
   return { success: true, skip_asset_cleanup: !currentStatus }
 }
 

@@ -14,3 +14,15 @@ export const createAdminClient = () => {
     }
   )
 }
+
+// Client khusus untuk mengakses Data Plane (Database Operasional CRM)
+export const createCrmAdminClient = () => {
+  const crmUrl = process.env.CRM_SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL!
+  const crmKey = process.env.CRM_SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY!
+  return createClient(crmUrl, crmKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  })
+}
